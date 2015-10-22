@@ -28,14 +28,14 @@ public class AssetPipelineResponseBuilder {
     }
 
     public String getCurrentETag() {
+
         def manifestPath = uri
         if (uri.startsWith('/')) {
             manifestPath = uri.substring(1) //Omit forward slash
         }
 
         def manifest = AssetPipelineConfigHolder.manifest
-
-        return manifest?.getProperty(manifestPath) ?: manifestPath
+        return "\"" + (manifest?.getProperty(manifestPath) ?: manifestPath) + "\""
     }
 
     public Boolean checkETag() {
@@ -44,7 +44,7 @@ public class AssetPipelineResponseBuilder {
             statusCode = 304
             return false
         }
-        headers["ETag"] = "$etagName"
+        headers["ETag"] = etagName
         return true
     }
 }

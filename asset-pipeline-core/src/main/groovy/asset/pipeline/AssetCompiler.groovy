@@ -17,11 +17,15 @@ package asset.pipeline
 
 import groovy.util.logging.Commons
 import asset.pipeline.processors.ClosureCompilerProcessor
+import asset.pipeline.utils.MultiOutputStream
 import asset.pipeline.processors.CssMinifyPostProcessor
+import java.util.zip.GZIPOutputStream
 
 
 /**
- * Build time compiler for assets
+ * Build time compiler for assets. This does a differential comparison of the source directory
+ * and the destination directory currently utilizing the manifest.properties file. This is primarily used
+ * during compilation. The gradle plugin uses this class to compile assets as does the grails gant plugin.
  *
  * @author David Estes
  * @author Graeme Rocher
@@ -36,6 +40,18 @@ class AssetCompiler {
 	def filesToProcess = []
 	Properties manifestProperties
 
+    /**
+     * Creates an instance of the compiler given passed input options
+     * @param options A Map of options that can be passed to the library
+     * <ul>
+     *  <li>compileDir - String Location of where assets should be compiled into</li>
+     *  <li>excludesGzip - List of extensions of files that should be excluded from gzip compression. (Most image types included by default)</li>
+     *  <li>enableGzip - Whether or not we should generate gzip files (default true)</li>
+     *  <li>enableDigests - Turns on generation of digest named assets (default true)</li>
+     *  <li>skipNonDigests - If turned on will not generate non digest named files (default false)</li>
+     * </ul>
+     * @param eventListener
+     */
 	AssetCompiler(options=[:], eventListener = null) {
 		this.eventListener = eventListener
 		this.options = options
@@ -72,15 +88,18 @@ class AssetCompiler {
 	/**
 	* Main Target Endpoint for Launching The AssetCompile in a Forked Execution Environment
 	* Arguments
-	* -o compileDir
-	* -i sourceDir (List of SourceDirs)
-	* -j List of Source Jars (, delimited)
-	* -d Digests
-	* -z Compression
-	* -m SourceMaps
-	* -n Skip Non Digests
-	* -c Config Location
-	* command - compile,watch
+	* <ul>
+	* <li>-o compileDir</li>
+	* <li>-i sourceDir (List of SourceDirs)</li>
+	* <li>-j List of Source Jars (, delimited)</li>
+	* <li>-d Digests</li>
+	* <li>-z Compression</li>
+	* <li>-m SourceMaps</li>
+	* <li>-n Skip Non Digests</li>
+	* <li>-c Config Location</li>
+	* <li>command - compile,watch</li>
+	* </ul>
+	* This is NOT YET IMPLEMENTED
 	*/
 	static void main(String[] args) {
 		def properties = new java.util.Properties()
@@ -161,7 +180,7 @@ class AssetCompiler {
 					}
 
 				} else {
-					digestName = AssetHelper.getByteDigest(assetFile.bytes)
+					digestName = assetFile.getByteDigest()
 					def existingDigestFile = manifestProperties.getProperty("${fileName}.${extension}")
 					if(existingDigestFile && existingDigestFile == "${fileName}-${digestName}.${extension}") {
 						isUnchanged=true
@@ -179,41 +198,80 @@ class AssetCompiler {
 					parentTree.mkdirs()
 
 					byte[] outputBytes
+					InputStream writeInputStream;
 					if(fileData) {
-						outputBytes = fileData
+						writeInputStream = new ByteArrayInputStream(fileData)
+						// outputBytes = fileData
 
 					} else {
 						if(assetFile instanceof GenericAssetFile) {
+							writeInputStream = assetFile.inputStream
 							outputBytes = assetFile.bytes
 						} else {
+							writeInputStream = assetFile.inputStream
 							outputBytes = assetFile.inputStream.bytes
-							digestName = AssetHelper.getByteDigest(assetFile.inputStream.bytes)
+							digestName = assetFile.getByteDigest()
 						}
 					}
+					// TODO: Streamify!
+					eventListener?.triggerEvent("StatusUpdate","Writing File ${index+1} of ${filesToProcess.size()} - ${fileName}")
+
+					byte[] buffer = new byte[4096]
+					int nRead
+					def outputFileStream
+					def digestFileStream
+					def gzipFileStream
+					def gzipStreamCollection = []
+
 					if(!options.skipNonDigests) {
 						outputFile.createNewFile()
-						outputFile.bytes = outputBytes
-					}
-
-					if(extension) {
-						try {
-							def digestedFile
-							if(options.enableDigests) {
-								digestedFile = new File(options.compileDir,"${fileSystemName}-${digestName}${extension ? ('.' + extension) : ''}")
-								digestedFile.createNewFile()
-								digestedFile.bytes = outputBytes
-							}
-							manifestProperties.setProperty("${fileName}.${extension}", "${fileName}-${digestName}${extension ? ('.' + extension) : ''}")
-
-							// Zip it Good!
-							if(options.enableGzip == true && !options.excludesGzip.find{ it.toLowerCase() == extension.toLowerCase()}) {
-								eventListener?.triggerEvent("StatusUpdate","Compressing File ${index+1} of ${filesToProcess.size()} - ${fileName}")
-								createCompressedFiles(outputFile,outputBytes, digestedFile)
-							}
-						} catch(ex) {
-							log.error("Error Compiling File ${fileName}.${extension}",ex)
+						outputFileStream = outputFile.newOutputStream()
+						if(options.enableGzip == true && !options.excludesGzip.find{ it.toLowerCase() == extension.toLowerCase()}) {
+							File zipFile = new File("${outputFile.getAbsolutePath()}.gz")
+							zipFile.createNewFile()
+							gzipStreamCollection << zipFile.newOutputStream()
 						}
 					}
+					if(extension) {
+						if(options.enableDigests) {
+							def digestedFile = new File(options.compileDir,"${fileSystemName}-${digestName}${extension ? ('.' + extension) : ''}")
+							digestedFile.createNewFile()
+							digestFileStream = digestedFile.newOutputStream()
+							if(options.enableGzip == true && !options.excludesGzip.find{ it.toLowerCase() == extension.toLowerCase()}) {
+								File zipFileDigest = new File("${digestedFile.getAbsolutePath()}.gz")
+								zipFileDigest.createNewFile()
+								gzipStreamCollection << zipFileDigest.newOutputStream()
+							}
+
+						}
+						manifestProperties.setProperty("${fileName}.${extension}", "${fileName}-${digestName}${extension ? ('.' + extension) : ''}")
+
+					}
+
+					if(gzipStreamCollection) {
+						MultiOutputStream targetStream = new MultiOutputStream(gzipStreamCollection)
+						gzipFileStream = new GZIPOutputStream(targetStream,true)
+					}
+					while ((nRead = writeInputStream.read(buffer, 0, buffer.length)) != -1) {
+					  // noop (just to complete the stream)
+					  outputFileStream?.write(buffer, 0, nRead);
+					  digestFileStream?.write(buffer, 0, nRead);
+					  gzipFileStream?.write(buffer, 0, nRead);
+					}
+					if(gzipFileStream) {
+						gzipFileStream.finish()
+						gzipFileStream.flush()
+						gzipFileStream.close()
+						gzipStreamCollection.each { stream ->
+							stream.flush()
+							stream.close()
+						}
+					}
+					digestFileStream?.flush()
+					outputFileStream?.flush()
+					digestFileStream?.close()
+					outputFileStream?.close()
+
 				}
 
 			}
@@ -279,28 +337,6 @@ class AssetCompiler {
 		manifestProperties.store(manifestFile.newWriter(),"")
 	}
 
-	@groovy.transform.CompileStatic
-	private void createCompressedFiles(File outputFile, byte[] outputBytes, File digestedFile) {
-		java.io.ByteArrayOutputStream targetStream  = new java.io.ByteArrayOutputStream()
-		java.util.zip.GZIPOutputStream zipStream     = new java.util.zip.GZIPOutputStream(targetStream)
-
-		zipStream.write(outputBytes)
-		zipStream.finish()
-		byte[] zipBytes = targetStream.toByteArray()
-		if(!options.skipNonDigests) {
-			File zipFile = new File("${outputFile.getAbsolutePath()}.gz")
-			zipFile.createNewFile()
-			zipFile.bytes = zipBytes
-		}
-
-		if(options.enableDigests as Boolean) {
-			File zipFileDigest = new File("${digestedFile.getAbsolutePath()}.gz")
-			zipFileDigest.createNewFile()
-			zipFileDigest.bytes = zipBytes
-		}
-
-		targetStream.close()
-	}
 
 	private removeDeletedFiles(filesToProcess) {
 		def compiledFileNames = filesToProcess.collect { assetFile ->
